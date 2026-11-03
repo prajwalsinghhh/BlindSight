@@ -1,78 +1,77 @@
 import { useEffect, useRef, useState } from "react";
-
 import * as ort from "onnxruntime-web";
 
 import { NAVIGATION_CLASSES } from "./constants/classes";
-
 import { preprocessImage } from "./vision/preprocess";
-
 import { processOutput } from "./vision/postprocess";
-
+import { processPotholeOutput } from "./vision/potholePostprocess";
 import { addDirections } from "./navigation/direction";
-
 import { getPathGeometry, addPathStatus } from "./navigation/pathAnalysis";
 
 const MODEL_PATH = "/models/yolo11n.onnx";
-
+const POTHOLE_MODEL_PATH = "/models/pothole_yolo11n.onnx";
 const DETECTION_INTERVAL = 150;
 
 function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const sessionRef = useRef(null);
+  const potholeSessionRef = useRef(null);
   const streamRef = useRef(null);
   const timerRef = useRef(null);
   const busyRef = useRef(false);
   const mountedRef = useRef(true);
 
   const [cameraActive, setCameraActive] = useState(false);
-
   const [modelLoaded, setModelLoaded] = useState(false);
-
-  const [status, setStatus] = useState("Loading YOLO11n...");
-
+  const [potholeModelLoaded, setPotholeModelLoaded] = useState(false);
+  const [status, setStatus] = useState("Loading YOLO models...");
   const [objectCount, setObjectCount] = useState(0);
-
   const [fps, setFps] = useState(0);
-
-  // ----------------------------------------
-  // INITIALIZATION
-  // ----------------------------------------
 
   useEffect(() => {
     mountedRef.current = true;
 
     const initialize = async () => {
       try {
-        // --------------------------------
-        // Load YOLO model
-        // --------------------------------
-
-        setStatus("Loading YOLO11n...");
-
+        setStatus("Loading existing YOLO11n model...");
         const session = await ort.InferenceSession.create(MODEL_PATH);
 
         if (!mountedRef.current) {
-          session.release();
+          await session.release();
           return;
         }
 
         sessionRef.current = session;
-
-        console.log("YOLO loaded");
-
-        console.log("Inputs:", session.inputNames);
-
-        console.log("Outputs:", session.outputNames);
-
+        console.log("Existing YOLO loaded", session.inputNames, session.outputNames);
         setModelLoaded(true);
 
-        // --------------------------------
-        // Start camera
-        // --------------------------------
+        // Load the pothole detector independently. If it fails, the original
+        // navigation detector and camera can still run.
+        try {
+          setStatus("Loading pothole detector...");
+          const potholeSession = await ort.InferenceSession.create(POTHOLE_MODEL_PATH);
+
+          if (!mountedRef.current) {
+            await potholeSession.release();
+            return;
+          }
+
+          potholeSessionRef.current = potholeSession;
+          console.log(
+            "Pothole model loaded",
+            potholeSession.inputNames,
+            potholeSession.outputNames
+          );
+          setPotholeModelLoaded(true);
+        } catch (error) {
+          console.error("Pothole model failed to load:", error);
+          if (mountedRef.current) {
+            setStatus(`Original model loaded; pothole model unavailable: ${error.message}`);
+          }
+        }
 
         setStatus("Starting camera...");
-
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             width: 640,
@@ -86,65 +85,49 @@ function App() {
 
         if (!videoRef.current) {
           stream.getTracks().forEach((track) => track.stop());
-
           return;
         }
 
         videoRef.current.srcObject = stream;
-
         await videoRef.current.play();
 
-        if (!mountedRef.current) {
-          return;
-        }
+        if (!mountedRef.current) return;
 
         setCameraActive(true);
-
-        setStatus("YOLO11n ready");
-
+        setStatus(
+          potholeSessionRef.current
+            ? "YOLO11n and pothole detector ready"
+            : "YOLO11n ready (pothole detector unavailable)"
+        );
         detectFrame();
       } catch (error) {
         console.error(error);
-
-        if (mountedRef.current) {
-          setStatus("Error: " + error.message);
-        }
+        if (mountedRef.current) setStatus("Error: " + error.message);
       }
     };
 
     initialize();
 
-    // --------------------------------
-    // Cleanup
-    // --------------------------------
-
     return () => {
       mountedRef.current = false;
 
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-      }
-
+      if (timerRef.current) clearTimeout(timerRef.current);
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop());
       }
-
       if (sessionRef.current) {
         sessionRef.current.release();
-
         sessionRef.current = null;
+      }
+      if (potholeSessionRef.current) {
+        potholeSessionRef.current.release();
+        potholeSessionRef.current = null;
       }
     };
   }, []);
 
-  // ----------------------------------------
-  // DETECTION LOOP
-  // ----------------------------------------
-
   const detectFrame = async () => {
-    if (!mountedRef.current) {
-      return;
-    }
+    if (!mountedRef.current) return;
 
     if (
       !sessionRef.current ||
@@ -153,308 +136,177 @@ function App() {
       busyRef.current
     ) {
       scheduleNextDetection();
-
       return;
     }
 
     busyRef.current = true;
-
     const startTime = performance.now();
+    let tensor;
 
     try {
-      // --------------------------------
-      // Preprocess image
-      // --------------------------------
+      const { tensor: inputTensor, scale, padX, padY } = preprocessImage(videoRef.current);
+      tensor = inputTensor;
+      const videoWidth = videoRef.current.videoWidth;
+      const videoHeight = videoRef.current.videoHeight;
 
-      const { tensor, scale, padX, padY } = preprocessImage(videoRef.current);
+      // Existing 80-class detector.
+      const existingFeeds = {
+        [sessionRef.current.inputNames[0]]: tensor,
+      };
+      const existingResults = await sessionRef.current.run(existingFeeds);
+      const existingOutput = existingResults[sessionRef.current.outputNames[0]];
 
-      // --------------------------------
-      // YOLO inference
-      // --------------------------------
-
-      const feeds = {};
-
-      feeds[sessionRef.current.inputNames[0]] = tensor;
-
-      const results = await sessionRef.current.run(feeds);
-
-      const output = results[sessionRef.current.outputNames[0]];
-
-      // --------------------------------
-      // Process YOLO output
-      // --------------------------------
-
-      const detections = processOutput(
-        output,
-        videoRef.current.videoWidth,
-        videoRef.current.videoHeight,
+      const existingDetections = processOutput(
+        existingOutput,
+        videoWidth,
+        videoHeight,
         scale,
         padX,
-        padY,
+        padY
       );
 
-      // --------------------------------
-      // Keep navigation objects
-      // --------------------------------
-
-      const navigationObjects = detections.filter((detection) =>
-        NAVIGATION_CLASSES.has(detection.className),
+      const navigationObjects = existingDetections.filter((detection) =>
+        NAVIGATION_CLASSES.has(detection.className)
       );
 
-      // --------------------------------
-      // Calculate direction
-      // --------------------------------
+      // New one-class pothole detector. Its output is [1, 5, 8400],
+      // so it must use its own decoder rather than the 80-class decoder.
+      let potholeDetections = [];
+      if (potholeSessionRef.current) {
+        const potholeFeeds = {
+          [potholeSessionRef.current.inputNames[0]]: tensor,
+        };
+        const potholeResults = await potholeSessionRef.current.run(potholeFeeds);
+        const potholeOutput = potholeResults[potholeSessionRef.current.outputNames[0]];
 
-      const directedObjects = addDirections(
-        navigationObjects,
-        videoRef.current.videoWidth,
-      );
+        potholeDetections = processPotholeOutput(
+          potholeOutput,
+          videoWidth,
+          videoHeight,
+          scale,
+          padX,
+          padY
+        );
+      }
 
-      // --------------------------------
-      // Calculate walking-path relevance
-      // --------------------------------
-
-      const pathDetections = addPathStatus(
-        directedObjects,
-        videoRef.current.videoWidth,
-        videoRef.current.videoHeight,
-      );
-
-      // --------------------------------
-      // Draw detections
-      // --------------------------------
+      const combinedDetections = [...navigationObjects, ...potholeDetections];
+      const directedObjects = addDirections(combinedDetections, videoWidth);
+      const pathDetections = addPathStatus(directedObjects, videoWidth, videoHeight);
 
       drawDetections(pathDetections);
 
-      // --------------------------------
-      // Object count
-      // --------------------------------
-
       if (mountedRef.current) {
         setObjectCount(pathDetections.length);
-      }
-
-      // --------------------------------
-      // FPS
-      // --------------------------------
-
-      const inferenceTime = performance.now() - startTime;
-
-      const currentFPS = 1000 / inferenceTime;
-
-      if (mountedRef.current) {
-        setFps(Math.round(currentFPS * 10) / 10);
+        const inferenceTime = performance.now() - startTime;
+        setFps(Math.round((1000 / inferenceTime) * 10) / 10);
       }
     } catch (error) {
       console.error("Detection error:", error);
+      if (mountedRef.current) setStatus(`Detection error: ${error.message}`);
+    } finally {
+      // Release the input tensor after both models have finished using it.
+      if (tensor && typeof tensor.dispose === "function") tensor.dispose();
+      busyRef.current = false;
+      scheduleNextDetection();
     }
-
-    busyRef.current = false;
-
-    scheduleNextDetection();
   };
 
-  // ----------------------------------------
-  // TIMER
-  // ----------------------------------------
-
   const scheduleNextDetection = () => {
-    if (!mountedRef.current) {
-      return;
-    }
-
+    if (!mountedRef.current) return;
     timerRef.current = setTimeout(detectFrame, DETECTION_INTERVAL);
   };
 
-  // ----------------------------------------
-  // DRAW
-  // ----------------------------------------
-
   const drawDetections = (detections) => {
     const canvas = canvasRef.current;
-
     const video = videoRef.current;
-
-    if (!canvas || !video) {
-      return;
-    }
+    if (!canvas || !video) return;
 
     canvas.width = video.videoWidth;
-
     canvas.height = video.videoHeight;
 
     const ctx = canvas.getContext("2d");
-
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const frameWidth = canvas.width;
-
     const frameHeight = canvas.height;
-
-    // --------------------------------
-    // WALKING PATH
-    // --------------------------------
-
     const path = getPathGeometry(frameWidth, frameHeight);
 
-    // Draw path fill
-
     ctx.beginPath();
-
     ctx.moveTo(path.topLeft, path.topY);
-
     ctx.lineTo(path.topRight, path.topY);
-
     ctx.lineTo(path.bottomRight, path.bottomY);
-
     ctx.lineTo(path.bottomLeft, path.bottomY);
-
     ctx.closePath();
-
     ctx.fillStyle = "rgba(0,255,0,0.08)";
-
     ctx.fill();
 
-    // Draw path outline
-
     ctx.strokeStyle = "rgba(0,255,0,0.7)";
-
     ctx.lineWidth = 2;
-
     ctx.stroke();
-
-    // --------------------------------
-    // DIRECTION ZONES
-    // --------------------------------
 
     const leftBoundary = frameWidth * 0.33;
-
     const rightBoundary = frameWidth * 0.67;
-
     ctx.lineWidth = 1;
-
     ctx.strokeStyle = "rgba(255,255,255,0.25)";
 
-    // Left boundary
-
     ctx.beginPath();
-
     ctx.moveTo(leftBoundary, 0);
-
     ctx.lineTo(leftBoundary, frameHeight);
-
     ctx.stroke();
-
-    // Right boundary
 
     ctx.beginPath();
-
     ctx.moveTo(rightBoundary, 0);
-
     ctx.lineTo(rightBoundary, frameHeight);
-
     ctx.stroke();
-
-    // --------------------------------
-    // CAMERA CENTER
-    // --------------------------------
 
     const center = frameWidth / 2;
-
     ctx.strokeStyle = "rgba(255,255,255,0.5)";
-
     ctx.beginPath();
-
     ctx.moveTo(center, 0);
-
     ctx.lineTo(center, frameHeight);
-
     ctx.stroke();
 
-    // --------------------------------
-    // DETECTION BOXES
-    // --------------------------------
-
     ctx.lineWidth = 3;
-
     ctx.font = "bold 15px Arial";
 
     detections.forEach((detection) => {
       const width = detection.x2 - detection.x1;
-
       const height = detection.y2 - detection.y1;
+      const isPothole =
+        detection.className?.toLowerCase().includes("pothole");
 
-      // --------------------------------
-      // Box color based on path status
-      // --------------------------------
-
-      let boxColor = "#ffffff";
-
+      let boxColor = isPothole ? "#ff3b30" : "#ffffff";
       if (detection.pathStatus === "IN PATH") {
-        boxColor = "#00ff66";
+        boxColor = isPothole ? "#ff3b30" : "#00ff66";
       } else if (detection.pathStatus === "PARTIAL") {
         boxColor = "#ffaa00";
       }
 
-      // --------------------------------
-      // Bounding box
-      // --------------------------------
-
       ctx.strokeStyle = boxColor;
-
       ctx.strokeRect(detection.x1, detection.y1, width, height);
 
-      // --------------------------------
-      // Object center
-      // --------------------------------
-
       const centerX = (detection.x1 + detection.x2) / 2;
-
       const centerY = (detection.y1 + detection.y2) / 2;
-
-      // Center point
-
       ctx.beginPath();
-
       ctx.arc(centerX, centerY, 5, 0, Math.PI * 2);
-
       ctx.fillStyle = "#ff0000";
-
       ctx.fill();
-
-      // --------------------------------
-      // Label
-      // --------------------------------
 
       const label =
         `${detection.className} ` +
         `${(detection.score * 100).toFixed(0)}% ` +
-        `${detection.direction} • ` +
-        `${detection.pathStatus}`;
+        `${detection.direction} • ${detection.pathStatus}`;
 
       const textWidth = ctx.measureText(label).width;
-
       const labelHeight = 27;
-
       const labelY = Math.max(0, detection.y1 - labelHeight);
 
-      // Label background
-
       ctx.fillStyle = boxColor;
-
       ctx.fillRect(detection.x1, labelY, textWidth + 10, labelHeight);
-
-      // Label text
-
       ctx.fillStyle = "black";
-
       ctx.fillText(label, detection.x1 + 5, Math.max(18, detection.y1 - 7));
     });
   };
-
-  // ----------------------------------------
-  // UI
-  // ----------------------------------------
 
   return (
     <div style={styles.container}>
@@ -464,16 +316,16 @@ function App() {
         <span>
           Camera: <strong>{cameraActive ? "Active" : "Inactive"}</strong>
         </span>
-
         <span>
-          Model:{" "}
-          <strong>{modelLoaded ? "YOLO11n Loaded" : "Loading..."}</strong>
+          Existing model: <strong>{modelLoaded ? "Loaded" : "Loading..."}</strong>
         </span>
-
+        <span>
+          Pothole model:{" "}
+          <strong>{potholeModelLoaded ? "Loaded" : "Unavailable / loading"}</strong>
+        </span>
         <span>
           Objects: <strong>{objectCount}</strong>
         </span>
-
         <span>
           Inference: <strong>{fps} FPS</strong>
         </span>
@@ -481,28 +333,21 @@ function App() {
 
       <div style={styles.cameraContainer}>
         <video ref={videoRef} autoPlay playsInline muted style={styles.video} />
-
         <canvas ref={canvasRef} style={styles.canvas} />
       </div>
 
       <p>{status}</p>
-
       <p style={styles.info}>LEFT ← &nbsp;&nbsp; CENTER &nbsp;&nbsp; → RIGHT</p>
 
       <div style={styles.legend}>
         <span>🟢 IN PATH</span>
-
         <span>🟠 PARTIAL</span>
-
         <span>⚪ OUTSIDE PATH</span>
+        <span>🔴 POTHOLE</span>
       </div>
     </div>
   );
 }
-
-// ----------------------------------------
-// STYLES
-// ----------------------------------------
 
 const styles = {
   container: {
@@ -515,7 +360,6 @@ const styles = {
     paddingTop: "30px",
     fontFamily: "Arial, sans-serif",
   },
-
   status: {
     display: "flex",
     gap: "30px",
@@ -523,7 +367,6 @@ const styles = {
     flexWrap: "wrap",
     justifyContent: "center",
   },
-
   cameraContainer: {
     position: "relative",
     width: "640px",
@@ -532,7 +375,6 @@ const styles = {
     overflow: "hidden",
     borderRadius: "12px",
   },
-
   video: {
     position: "absolute",
     top: 0,
@@ -541,7 +383,6 @@ const styles = {
     height: "100%",
     objectFit: "fill",
   },
-
   canvas: {
     position: "absolute",
     top: 0,
@@ -550,17 +391,17 @@ const styles = {
     height: "100%",
     pointerEvents: "none",
   },
-
   info: {
     color: "#888",
     fontSize: "14px",
   },
-
   legend: {
     display: "flex",
     gap: "25px",
     marginTop: "10px",
     fontSize: "14px",
+    flexWrap: "wrap",
+    justifyContent: "center",
   },
 };
 
