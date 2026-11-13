@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Drishti</string>
+    <string name="title_activity_main">Drishti</string>
+    <string name="package_name">edu.rvce.drishti</string>
+    <string name="custom_url_scheme">edu.rvce.drishti</string>
+</resources>

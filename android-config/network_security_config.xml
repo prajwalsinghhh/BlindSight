@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext HTTP/WS is allowed ONLY for the wearable's address(es).
+  Everything else stays HTTPS-only. Android cannot whitelist IP ranges, so
+  list each address the ESP32 can have, one <domain> line each.
+-->
+<network-security-config>
+  <base-config cleartextTrafficPermitted="false">
+    <trust-anchors>
+      <certificates src="system" />
+    </trust-anchors>
+  </base-config>
+  <domain-config cleartextTrafficPermitted="true">
+    <domain includeSubdomains="false">localhost</domain>
+    <!-- ESP32 in SoftAP mode (default address) -->
+    <domain includeSubdomains="false">192.168.4.1</domain>
+    <!-- mDNS name, if the firmware advertises one (not reliable on all phones) -->
+    <domain includeSubdomains="false">drishti.local</domain>
+    <!-- ADD the ESP32's address if it joins your router, e.g.: -->
+    <!-- <domain includeSubdomains="false">192.168.1.50</domain> -->
+  </domain-config>
+</network-security-config>

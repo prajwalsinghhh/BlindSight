@@ -16,7 +16,6 @@ export function processOutput(
   const data = output.data;
   const dims = output.dims;
 
-  console.log("YOLO output:", dims);
 
   const numClasses = 80;
 

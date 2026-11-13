@@ -66,3 +66,4 @@ models/
 
 !public/models/
 !public/models/*.onnx
+public/ort
