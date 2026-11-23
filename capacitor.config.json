@@ -1,0 +1,16 @@
+{
+  "appId": "edu.rvce.drishti",
+  "appName": "Drishti",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http"
+  },
+  "plugins": {
+    "CapacitorHttp": { "enabled": true },
+    "SplashScreen": {
+      "launchShowDuration": 1200,
+      "backgroundColor": "#05070b",
+      "showSpinner": false
+    }
+  }
+}
